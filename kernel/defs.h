@@ -106,6 +106,12 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+void            ps(int);
+int             getnice(int);
+int             setnice(int pid, int value);
+uint64          meminfo(void);
+int             waitpid(int);
+uint64          mmap(uint64 addr, int length, int prot, int flags, int fd, int offset);
 
 // swtch.S
 void            swtch(struct context*, struct context*);

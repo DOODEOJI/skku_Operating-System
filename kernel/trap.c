@@ -77,8 +77,16 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  if(which_dev == 2){
+    p->running_ticks++;
+    global_tick++;
+    p->vruntime += 1000 * weight_arr[20] / weight_arr[p->nice_value];
+    p->time_slice--;
+    if (p->time_slice <= 0){
+      p->time_slice = TIMESLICE - 1;
+      yield();
+    }
+  }
 
   usertrapret();
 }
@@ -173,7 +181,7 @@ clockintr()
   // ask for the next timer interrupt. this also clears
   // the interrupt request. 1000000 is about a tenth
   // of a second.
-  w_stimecmp(r_time() + 1000000);
+  w_stimecmp(r_time() + 100000);
 }
 
 // check if it's an external interrupt or software interrupt,

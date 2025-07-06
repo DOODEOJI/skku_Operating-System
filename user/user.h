@@ -1,4 +1,5 @@
 struct stat;
+struct mem_info;
 
 // system calls
 int fork(void);
@@ -22,6 +23,12 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+void ps(int);
+int getnice(int);
+int setnice(int, int);
+uint64 meminfo(void);
+int waitpid(int);
+uint64 mmap(uint64, int, int, int, int, int);
 
 // ulib.c
 int stat(const char*, struct stat*);

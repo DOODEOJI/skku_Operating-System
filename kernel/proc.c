@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "kalloc.h"
 
 struct cpu cpus[NCPU];
 
@@ -29,6 +30,22 @@ struct spinlock wait_lock;
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
+
+int weight_arr[40] = {
+	/*  0 */  88761, 71755, 56483, 46273, 36291,
+	/*  5 */  29154, 23254, 18705, 14949, 11916,
+	/* 10 */   9548,  7620,  6100,  4904,  3906,
+	/* 15 */   3121,  2501,  1991,  1586,  1277,
+	/* 20 */   1024,   820,   655,   526,   423,
+	/* 25 */    335,   272,   215,   172,   137,
+	/* 30 */    110,    87,    70,    56,    45,
+	/* 35 */     36,    29,    23,    18,    15,};
+
+int global_tick = 0;
+int wsum = 0;
+
+struct mmap_area mmap_area[64];
+
 void
 proc_mapstacks(pagetable_t kpgtbl)
 {
@@ -145,7 +162,15 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
+  
+  p->nice_value = 20;
+  p->running_ticks = 0;
+  p->vruntime = 0;
+  p->vdeadline = p->vruntime + TIMESLICE * 1000 * weight_arr[20] / p->nice_value;
+  p->is_eligible = 1;
+  p->time_slice = TIMESLICE - 1;
+  
+  if (!holding(&p->lock)) printf("already released lock\n");
   return p;
 }
 
@@ -168,7 +193,12 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
-  p->state = UNUSED;
+  p->state = UNUSED;  
+  p->nice_value = 0;
+  p->running_ticks = 0;
+  p->vdeadline = 0;
+  p->is_eligible = 0;
+  p->time_slice = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -235,6 +265,8 @@ userinit(void)
   struct proc *p;
 
   p = allocproc();
+  if (p==0) printf("allocproc failed");
+  if (!holding(&p->lock)) printf("already released lock\n");
   initproc = p;
   
   // allocate one user page and copy initcode's instructions
@@ -250,7 +282,9 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
-
+  if (!holding(&p->lock)) {
+    printf("Not holding p->lock in userinit before release!\n");
+  }	 
   release(&p->lock);
 }
 
@@ -287,7 +321,6 @@ fork(void)
   if((np = allocproc()) == 0){
     return -1;
   }
-
   // Copy user memory from parent to child.
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
@@ -309,18 +342,24 @@ fork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+  np->nice_value = p->nice_value;
+
+  np->vruntime = p->vruntime;
+  np->vdeadline = np->vruntime + TIMESLICE * weight_arr[20] / weight_arr[np->nice_value];
 
   pid = np->pid;
-
+  np->state = RUNNABLE;
+  
+  if (!holding(&np->lock)) printf("no lock in pid : %d/n",np->pid);
   release(&np->lock);
 
   acquire(&wait_lock);
   np->parent = p;
   release(&wait_lock);
 
-  acquire(&np->lock);
-  np->state = RUNNABLE;
-  release(&np->lock);
+  //acquire(&np->lock);
+  //np->state = RUNNABLE;
+  //release(&np->lock);
 
   return pid;
 }
@@ -444,34 +483,76 @@ wait(uint64 addr)
 void
 scheduler(void)
 {
+  struct proc *p0;
+  struct proc *p1;
   struct proc *p;
+  struct proc *min_p = 0;
   struct cpu *c = mycpu();
 
   c->proc = 0;
   for(;;){
+    intr_on();
+
+    int min_vruntime = 1 << 30;
+    int min_vdeadline = 1 << 30;
+    int vsum = 0;
+
+    wsum = 0;
+    for(p0 = proc; p0 < &proc[NPROC]; p0++){
+      if (p0->state != RUNNABLE) continue;
+
+      wsum += weight_arr[p0->nice_value];
+
+      if (p0->vruntime < min_vruntime) min_vruntime = p0->vruntime;
+    }
+    for(p1 = proc; p1 < &proc[NPROC]; p1++){
+      if (p0->state != RUNNABLE) continue;
+      vsum += (p1->vruntime - min_vruntime) * weight_arr[p1->nice_value];
+    }
+
     // The most recent process to run may have had interrupts
     // turned off; enable them to avoid a deadlock if all
     // processes are waiting.
-    intr_on();
 
     int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
+      if (p->state != RUNNABLE){
+        continue;
+      }
+      
       acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+      if (vsum < (p->vruntime - min_vruntime) * wsum){
+        p->is_eligible = 0;
+        release(&p->lock);
+	      continue;
+      }
+
+      p->is_eligible = 1;
+
+      if (p->vdeadline < min_vdeadline){
+        min_p = p;
+	      min_vdeadline = p->vdeadline;
       }
       release(&p->lock);
     }
+    // Switch to chosen process.  It is the process's job
+    // to release its lock and then reacquire it
+    // before jumping back to us.
+    if (min_p){
+      acquire(&min_p->lock);
+      min_p->state = RUNNING;
+      c->proc = min_p;
+
+      swtch(&c->context, &min_p->context);
+
+      // Process is done running for now.
+      // // It should have changed its p->state before coming back.
+      c->proc = 0;
+      found = 1;
+      release(&min_p->lock);
+    }
+
     if(found == 0) {
       // nothing to run; stop running on this core until an interrupt.
       intr_on();
@@ -514,6 +595,7 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
+  p->vdeadline = p->vruntime + TIMESLICE * 1000 * weight_arr[20] / weight_arr[p->nice_value]; 
   sched();
   release(&p->lock);
 }
@@ -585,6 +667,8 @@ wakeup(void *chan)
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+	      p->time_slice = TIMESLICE - 1;
+        p->vdeadline = p->vruntime + TIMESLICE * 1000 * weight_arr[20] / weight_arr[p->nice_value];
       }
       release(&p->lock);
     }
@@ -693,3 +777,287 @@ procdump(void)
     printf("\n");
   }
 }
+
+void
+ps(int pid)
+{
+  static char *states[] ={
+  [UNUSED]    "UNUSED",
+  [USED]      "USED",
+  [SLEEPING]  "SLEEPING",
+  [RUNNABLE]  "RUNNABLE",
+  [RUNNING]   "RUNNING",
+  [ZOMBIE]    "ZOMBIE"
+  };
+  
+  int lens(char* s){
+    int len = 0;
+    while(*s){
+      len++;
+      s++;
+    }
+    return len;
+  }
+
+  int leni(int i){
+    int len = 0;
+    if (i == 0) return 1;
+    while (i > 0){
+      len++;
+      i/=10;
+    }
+    return len;
+  }
+
+  void print_header(int name_r, int rt_r, int vrt_r, int vdl_r){
+    printf("name  ");
+    for(int i=0;i<(name_r-4);i++) printf(" ");
+    printf("pid      ");
+    printf("state       ");
+    printf("priority    ");
+    printf("runtime/weight    ");
+    printf("runtime");
+    for(int i=0;i<(rt_r-7);i++) printf(" ");
+    printf("vruntime");
+    for(int i=0;i<(vrt_r-8);i++) printf(" ");
+    printf("vdeadline");
+    for(int i=0;i<(vdl_r-9);i++) printf(" ");
+    printf("is_eligible");
+    for(int i=0;i<2;i++) printf(" ");
+    printf("tick %d",global_tick*1000);
+    printf("\n");  
+  }
+
+  void print_proc_info(int pid){
+    struct proc *p;
+
+    int max_name_length = 0;
+    int max_runtime_length = 0;
+    int max_vruntime_length = 0;
+    int max_vrdeadline_length = 0;
+
+    for (p=proc; p < &proc[NPROC]; p++){
+      if (p->state == 0) continue;
+      if (lens(p->name)>max_name_length) max_name_length = lens(p->name);
+      if (leni(p->running_ticks * 1000)>max_runtime_length) max_runtime_length = leni(p->running_ticks * 1000);
+      if (leni(p->vruntime)>max_vruntime_length) max_vruntime_length = leni(p->vruntime);
+      if (leni(p->vdeadline)>max_vrdeadline_length) max_vrdeadline_length = leni(p->vdeadline);
+      
+
+    max_runtime_length = max_runtime_length < 6 ? 6 : max_runtime_length;
+    max_vruntime_length = max_vruntime_length < 6 ? 6 : max_vruntime_length;
+    max_vrdeadline_length = max_vrdeadline_length < 6 ? 6 : max_vrdeadline_length;
+
+    #define ROUND_UP6(x) ((((x) / 6) + 1) * 6)
+
+    int name_range = ROUND_UP6(max_name_length);
+    int rt_range   = ROUND_UP6(max_runtime_length);
+    int vrt_range  = ROUND_UP6(max_vruntime_length);
+    int vdl_range  = ROUND_UP6(max_vrdeadline_length);
+
+    print_header(name_range, rt_range, vrt_range, vdl_range);
+    
+    for (p=proc; p < &proc[NPROC]; p++){
+      if (pid == 0 || pid == p->pid){
+        if (p->state == UNUSED) continue;
+
+        printf("%s",p->name);
+        int l1 = lens(p->name);
+        for(int i=0;i<(name_range-l1+2);i++) printf(" ");
+          
+        printf("%d",p->pid);
+        int l2 = leni(p->pid);
+        for(int i=0;i<(9-l2);i++) printf(" ");
+
+        printf("%s",states[p->state]);
+        int l3 = lens(states[p->state]);
+        for(int i=0;i<(12-l3);i++) printf(" ");
+
+        printf("%d",p->nice_value);
+        int l4 = leni(p->nice_value);
+        for(int i=0;i<(12-l4);i++) printf(" ");
+
+        printf("%d",p->running_ticks * 1000/weight_arr[p->nice_value]); 
+        int l5 = leni(p->running_ticks * 1000/weight_arr[p->nice_value]);
+        for(int i=0;i<(18-l5);i++) printf(" ");
+
+        printf("%d",p->running_ticks * 1000);
+        int l6 = leni(p->running_ticks * 1000);
+        for(int i=0;i<(rt_range-l6);i++) printf(" ");
+
+        printf("%d",p->vruntime);
+        int l7 = leni(p->vruntime);
+        for(int i=0;i<(vrt_range-l7);i++) printf(" ");
+
+        printf("%d",p->vdeadline);
+        int l8 = leni(p->vdeadline);
+        for(int i=0;i<(vdl_range-l8);i++) printf(" ");
+
+        if (p->is_eligible == 1) printf("True");
+        else printf("False");
+        printf("\n");
+        }
+      }
+    }
+  }
+
+  if (pid < 0){
+    printf("Don't input negative value\n");
+  }
+
+  else if(pid ==0) {
+    print_proc_info(pid);
+  }
+  else{
+    print_proc_info(pid);
+  }
+}
+
+int
+getnice(int pid)
+{
+  struct proc *p;
+  for (p=proc; p < &proc[NPROC]; p++){
+    if (p -> pid == pid) return p->nice_value;
+  }
+  return -1;
+}
+
+int
+setnice(int pid, int value)
+{
+  struct proc *p;
+
+  if (value < 0 || value > 39){
+	  printf("nice_value는 0~39 사이의 값이어야합니다.\n");
+	  return -1;
+  }
+
+  for (p=proc; p < &proc[NPROC]; p++){
+    if (p -> pid == pid){
+      wsum -= p->nice_value;
+      p->nice_value = value;
+      wsum += p->nice_value;
+
+      p->vdeadline = p->vruntime + TIMESLICE * 1000 * 1024 / weight_arr[p->nice_value];
+
+      return 0;
+    }
+  }
+  printf("입력하신 pid가 존재하지 않습니다.\n");
+  return -1;
+}
+
+uint64
+meminfo(void)
+{
+  uint64 avail;
+  // avail_memory()는 kalloc.c에 존재
+  avail = avail_memory();
+  return avail;
+}
+
+int
+waitpid(int pid)
+{
+  struct proc *p = myproc();
+  struct proc *c = proc;
+
+  for (; c<&proc[NPROC]; c++){
+    if (c->pid == pid && c->parent == p){
+      while (c->state != ZOMBIE){
+	acquire(&tickslock);
+        sleep(&ticks, &tickslock);
+	release(&tickslock);
+      }
+      return 0;
+    }
+  }
+  return -1;
+} 
+
+uint64
+mmap(uint64 addr, int length, int prot, int flags, int fd, int offset)
+{
+	if ((addr % PGSIZE) != 0) panic("mmap: addr not aligned");
+	if ((length % PGSIZE) != 0) panic("mmap: page size not aligned");
+	if (length == 0) panic("mmap: size zero");
+	
+  int is_populate = flags & MAP_POPULATE;
+  int is_anonymous = flags & MAP_ANONYMOUS;
+  int is_readable = prot & PROT_READ;
+  int is_writable = prot & PROT_WRITE;
+
+	struct proc *p = myproc();
+	struct file *f = p->ofile[fd];
+
+  if (f)
+  { 
+    if (!f->readable && is_readable) return 0;
+    if (!f->writable && is_writable) return 0;
+  }
+
+	addr += MMAPBASE;
+
+  int k = 0;
+  while (mmap_area[k]->used != 0) k++;
+  mmap_area[k]->f = f;
+  mmap_area[k]->addr = addr;
+  mmap_area[k]->length = length;
+  mmap_area[k]->offset = offset;
+  mmap_area[k]->prot = prot;
+  mmap_area[k]->flags = flags;
+  mmap_area[k]->p = p;
+  mmap_area[k]->used = 1;
+	
+	if (is_populate && !is_anonymous) // with MAP_POPULATE, without MAP_ANONYMOUS
+  {
+		int i = length / PGSIZE;
+
+		for (int j = 0; j < i; j++){
+			char *physical_page = (char *)kalloc();
+			if (!physical_page) panic("kalloc failed for arr[%d]",i);
+
+			mappages(p->pagetable, addr, PGSIZE, (uint64)physical_page, PTE_W | PTE_R | PTE_U);
+			
+			ilock(f->ip);
+			readi(f->ip, 1, addr, offset, PGSIZE); // user_dst == 0 or 1
+			iunlock(f->ip);
+			
+			offset += PGSIZE;
+			addr += PGSIZE;
+		}
+    return addr;
+  }
+  if (!is_populate && is_anonymous) // without MAP_POPULATE, with MAP_ANONYMOUS
+  {
+    return addr; //page fault
+  }
+
+  if(!is_populate && !is_anonymous) // without MAP_POPULATE, without MAP_ANONYMOUS
+  {
+    return addr; //page fault
+  }
+
+  else if (is_populate && is_anonymous) // with MAP_POPULATE, with MAP_ANONYMOUS
+  {
+    if (fd != -1) return 0;
+    if (offset != 0) return 0;
+
+		int i = length / PGSIZE;
+
+		for (int j = 0; j < i; j++){
+			char *physical_page = (char *)kalloc();
+			if (!physical_page) panic("kalloc failed for arr[%d]",i);
+      memset(physical_page, 0, PGSIZE);
+
+			mappages(p->pagetable, addr, PGSIZE, (uint64)physical_page, PTE_W | PTE_R | PTE_U);
+			
+			offset += PGSIZE;
+			addr += PGSIZE;
+    }
+  return addr;
+  }
+}
+
+		

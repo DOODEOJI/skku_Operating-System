@@ -104,4 +104,26 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  int nice_value;              // Priority
+  int running_ticks;	       // To check 5 ticks
+  int time_slice;              // its time slice
+  int vruntime;		       // virtual runtime
+  int vdeadline;	       // virtual deadline
+  int is_eligible;             // eligibility
+  struct mmap_area *mmap_area;
 };
+
+extern int weight_arr[40];
+extern int global_tick;
+extern int wsum;
+
+struct mmap_area {
+	struct file *f;
+	uint64 addr;
+	int length;
+	int offset;
+	int prot;
+	int flags;
+	struct proc *p;
+	int used;
+}
